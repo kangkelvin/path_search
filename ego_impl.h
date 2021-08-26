@@ -1,108 +1,152 @@
 #include "ego.h"
-
-#include <array>
-#include <assert.h>
-#include <string>
+#include "math_helper.h"
 
 namespace ego {
 
 template <std::size_t Size>
-Ego::Ego(const std::string &init_loc, const std::string &goal_loc,
+Ego::Ego(const ChargerLoc &init_loc, const ChargerLoc &goal_loc,
          const std::array<row, Size> &network)
-    : curr_loc_(init_loc), goal_loc_(goal_loc) {
+    : init_loc_(init_loc), goal_loc_(goal_loc) {
   // Create network map from network array
   for (const auto &node : network) {
     network_map_.emplace(node.name, ChargerInfo(DegToRad(node.lat),
                                                 DegToRad(node.lon), node.rate));
   }
 
-  // Calc dist to goal from all nodes
+  // Calc dist to goal from all nodes, used for A* heuristics
   for (auto &node : network_map_) {
-    node.second.dist_to_goal =
-        GetDistBetweenTwoChargers(network_map_, node.first, goal_loc_);
+    node.second.dist_to_goal = GetDistBetweenTwoChargers(node.first, goal_loc_);
   }
 
-  delta_to_goal_ = network_map_.at(curr_loc_).dist_to_goal;
+  CreateNetworkAdjList();
 }
 
 void Ego::CalcPathAndPrint() {
-  std::cout << curr_loc_ << ", ";
+  using ChargerCostPair = std::pair<ChargerLoc, double>;
+  const auto cmp = [](const ChargerCostPair &lhs, const ChargerCostPair &rhs) {
+    return lhs.second > rhs.second;
+  };
+  std::priority_queue<ChargerCostPair, std::vector<ChargerCostPair>,
+                      decltype(cmp)>
+      priority_queue(cmp);
 
-  while (true) {
-    const auto search_result = this->FindFurthestReachableCharger(curr_loc_);
-    // For last charge optimization
-    const auto search_result_lookahead =
-        this->FindFurthestReachableCharger(search_result.charger_name);
-
-    // Termination case
-    if (search_result.charger_name == goal_loc_) {
-      std::cout << goal_loc_;
-      return;
-    }
-
-    this->GotoChargerAndUpdateState(search_result);
-
-    const double charge_time =
-        this->ChargeAndGetChargingTime(search_result_lookahead);
-
-    std::cout << search_result.charger_name << ", " << charge_time << ", ";
-  }
-}
-
-Ego::ChargerSearchInfo
-Ego::FindFurthestReachableCharger(const std::string &search_loc) {
-  double final_dist_to_charger = 0.0;
-  double min_time_cost = std::numeric_limits<double>::max();
-  std::string furthest_charger = search_loc;
+  // Tracks chargers that have been visited
+  std::unordered_map<ChargerLoc, bool> visited;
+  // Time cost to come to chargers
+  std::unordered_map<ChargerLoc, double> cost_to_come;
+  // Tracks the parent nodes, to obtain best path at the end
+  std::unordered_map<ChargerLoc, ChargerCostPair> parent;
 
   for (const auto &node : network_map_) {
-    if (search_loc == node.first) {
-      continue;
-    }
-
-    if (node.second.dist_to_goal > delta_to_goal_) {
-      continue;
-    }
-
-    const double dist_to_charger =
-        GetDistBetweenTwoChargers(network_map_, search_loc, node.first);
-
-    const double time_cost = node.second.dist_to_goal / kEgoSpeed +
-                             (kMaxCharge - dist_to_charger) / node.second.rate;
-
-    if (dist_to_charger < curr_charge_ && time_cost < min_time_cost) {
-      final_dist_to_charger = dist_to_charger;
-      min_time_cost = time_cost;
-      furthest_charger = node.first;
-    }
-  }
-  return ChargerSearchInfo(furthest_charger, final_dist_to_charger);
-}
-
-void Ego::GotoChargerAndUpdateState(
-    const ChargerSearchInfo &next_charger_info) {
-  curr_loc_ = next_charger_info.charger_name;
-  curr_charge_ -= next_charger_info.dist_to_charger;
-  delta_to_goal_ = network_map_.at(curr_loc_).dist_to_goal;
-  assert(curr_charge_ > 0.0);
-}
-
-double Ego::ChargeAndGetChargingTime(
-    const ChargerSearchInfo &search_result_lookahead) {
-  // calculate charging time and update ego's charge
-  const auto helper_func = [this](double target_charge) {
-    const double charge_time =
-        (target_charge - curr_charge_) / network_map_.at(curr_loc_).rate;
-    curr_charge_ = target_charge;
-    return charge_time;
-  };
-
-  // special case just before reaching goal. Charge just enough to reach goal.
-  if (search_result_lookahead.charger_name == goal_loc_) {
-    return helper_func(search_result_lookahead.dist_to_charger);
+    visited.emplace(node.first, false);
+    cost_to_come.emplace(node.first, std::numeric_limits<double>::max());
   }
 
-  return helper_func(kMaxCharge);
+  // Init starting conditions for A* search
+  priority_queue.emplace(init_loc_, 0);
+  visited[init_loc_] = true;
+  cost_to_come.at(init_loc_) = 0.0;
+  ChargerCostPair dummy = std::make_pair(init_loc_, 0.0);
+  parent.emplace(init_loc_, dummy);
+  bool solution_found = false;
+
+  while (!priority_queue.empty()) {
+    const auto front = priority_queue.top();
+    priority_queue.pop();
+
+    if (front.first == goal_loc_) {
+      solution_found = true;
+      break;
+    }
+
+    for (const auto &neighbor : network_adj_list_.at(front.first)) {
+      const double cost_to_go = neighbor.second.GetTotalCost();
+      if (cost_to_come.at(neighbor.first) >
+          cost_to_come.at(front.first) + cost_to_go) {
+        cost_to_come.at(neighbor.first) =
+            cost_to_come.at(front.first) + cost_to_go;
+        parent.emplace(
+            neighbor.first,
+            std::make_pair(front.first, neighbor.second.charge_cost));
+      }
+      if (!visited.at(neighbor.first)) {
+        // A* heuristics
+        const double cost_and_heuristics =
+            cost_to_come.at(neighbor.first) +
+            network_map_.at(neighbor.first).dist_to_goal / kEgoSpeed;
+        priority_queue.emplace(neighbor.first, cost_and_heuristics);
+        visited.at(neighbor.first) = true;
+      }
+    }
+  }
+
+  if (solution_found) {
+    std::vector<ChargerCostPair> solution;
+
+    {
+      ChargerLoc iter = goal_loc_;
+      while (iter != init_loc_) {
+        solution.push_back(parent.at(iter));
+        iter = parent.at(iter).first;
+      }
+    }
+
+    std::cout << init_loc_ << ", ";
+
+    for (auto it = solution.rbegin() + 1; it != solution.rend(); ++it) {
+      // Special case at the last charger, only charge enough to go to goal
+      if (it + 1 == solution.rend()) {
+        const double charge_to_full = it->second;
+        const double charge_rate = network_map_.at(it->first).rate;
+        const double remaining_charge =
+            kMaxCharge - it->second * network_map_.at(it->first).rate;
+        const double opt_cost =
+            (network_map_.at(it->first).dist_to_goal - remaining_charge) /
+            charge_rate;
+
+        std::cout << it->first << ", " << opt_cost << ", ";
+      } else {
+        // Default case, charge to full before going to next charger
+        std::cout << it->first << ", " << it->second << ", ";
+      }
+    }
+
+    std::cout << goal_loc_ << std::endl;
+  } else {
+    std::cout << "Solution Not Found\n";
+  }
+}
+
+double Ego::GetDistBetweenTwoChargers(const ChargerLoc &initial_charger_name,
+                                      const ChargerLoc &goal_charger_name) {
+  const auto init_iter = network_map_.find(initial_charger_name);
+  const auto goal_iter = network_map_.find(goal_charger_name);
+
+  return GetGreatCircleDist(init_iter->second, goal_iter->second);
+}
+
+void Ego::CreateNetworkAdjList() {
+  // Create network adjacency list for graph search
+  for (const auto &node : network_map_) {
+    network_adj_list_.emplace(node.first, NetworkMap());
+    for (const auto &neighbor : network_map_) {
+      if (node.first == neighbor.first) {
+        continue;
+      }
+
+      const double dist_to_neighbor =
+          GetGreatCircleDist(node.second, neighbor.second);
+      if (dist_to_neighbor > kMaxCharge) {
+        continue;
+      }
+
+      network_adj_list_.at(node.first).emplace(neighbor.first, neighbor.second);
+      network_adj_list_.at(node.first).at(neighbor.first).drive_cost =
+          dist_to_neighbor / kEgoSpeed;
+      network_adj_list_.at(node.first).at(neighbor.first).charge_cost =
+          dist_to_neighbor / neighbor.second.rate;
+    }
+  }
 }
 
 } // namespace ego
