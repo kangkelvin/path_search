@@ -96,7 +96,6 @@ void Ego::CalcPathAndPrint() {
     for (auto it = solution.rbegin() + 1; it != solution.rend(); ++it) {
       // Special case at the last charger, only charge enough to go to goal
       if (it + 1 == solution.rend()) {
-        const double charge_to_full = it->second;
         const double charge_rate = network_map_.at(it->first).rate;
         const double remaining_charge =
             kMaxCharge - it->second * network_map_.at(it->first).rate;
